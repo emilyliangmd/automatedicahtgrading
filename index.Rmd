@@ -1,0 +1,506 @@
+---
+title: "Automated approach to grade early and late ICAHT by EHA/EBMT criteria"
+description: 
+author:
+  - name: Emily C. Liang, MD
+    affiliation: University of Washington and Fred Hutchinson Cancer Center
+date: "`r Sys.Date()`"
+output:
+  distill::distill_article:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+  
+---
+
+```{r setup, include = FALSE}
+library(distill)
+library(knitr)
+library(rmarkdown)
+```
+
+## Install and load the required packages
+
+```{r, eval = FALSE, include = TRUE}
+install.packages("openxlsx")
+install.packages("here")
+install.packages("tidyverse")
+install.packages("zoo")
+remotes::install_github('robwschlegel/heatwaveR') # Install the latest commit from GitHub
+```
+
+
+```{r}
+library(openxlsx)
+library(here)
+library(tidyverse)
+library(zoo)
+library(heatwaveR)
+```
+
+## Import dataset from Excel spreadsheet
+You can import your data as follows. Here, we are using the example Excel file. We require a "long" data frame containing patient identifiers and multiple rows per patient: date of CAR T-cell infusion, dates of laboratory testing, the laboratory value of interest (in this case, ANC) for each date, date of relapse or progression, and date of last follow-up. 
+
+```{r}
+df <-
+  read.xlsx(here("dfs", "Synthetic ANC Dataset.xlsx"), # Replace "dfs" with name of sub-folder containing Excel file, if applicable
+            detectDates = TRUE)
+
+paged_table(df)
+```
+
+## Automated grading of early ICAHT 
+
+### Data wrangling/formatting 
+As shown above, ANC values may not be available on all dates. To address the lack of daily ANC data, we will create additional rows for each missing timepoint and impute the corresponding missing ANC values using linear interpolation.
+
+#### Addition of additional rows for missing time points
+First, we modify our dataset to include rows for each missing day. To achieve this, for each subject we create a separate column “time_post_inf” containing one row per day. For simplicity’s sake we restrict the time period to days 0 through 30 (i.e., 31 rows), although our approach could be applied to any time period. We also remove the dates of subsequent therapy and relapse/progression columns since they are unnecessary.
+
+```{r}
+df_early_icaht <- df %>% 
+  select(-subsequent_therapy_date, -progression_date) %>% # Remove columns
+  mutate(time_post_inf = as.numeric(date - cart_date)) %>% # Compute days post-infusion
+  filter(time_post_inf %in% 0:30) # Select the day 0 through day +30 timepoints
+
+paged_table(df_early_icaht)
+```
+
+In the case that ANC is checked more than once on a particular day, we 1) keep unique ANC values and 2) keep the lowest ANC value.
+
+```{r}
+df_early_icaht <- df_early_icaht %>%
+  distinct(patient_id,
+           time_post_inf,
+           anc,
+           .keep_all = TRUE) %>% # Keep unique combinations of these variables
+  group_by(patient_id, time_post_inf) %>% # Group by patient_id and time_post_inf
+  slice_min(anc) %>% # For each combination of patient_id and time_post_inf, keep the lowest ANC value
+  ungroup()
+```
+
+Next, we create a data frame that contains replicated patient IDs. Each patient ID will be replicated once for each “time_post_inf”. To achieve this, first we extract each patient_id from df_early_icaht, along with the corresponding dates of CAR T-cell infusion and last follow-up:
+
+```{r}
+df_extract <- df_early_icaht %>%
+  distinct(patient_id, cart_date, last_fu_date)
+
+kable(df_extract)
+```
+
+We create a function called replicate_ids() that replicates the patient IDs according to date of last follow-up. If date of last follow-up occurred after day +30, the patient ID should be replicated 31 times (once for each day between day 0-30). Otherwise, the patient ID should be replicated according to the number of days of follow-up.
+
+```{r}
+replicate_ids <- function(patient_id, cart_date, last_fu_date) {
+  if (is.na(last_fu_date) | (last_fu_date - cart_date) >= 30) { # If last follow-up date is missing or is ≥30 days from CAR T-cell infusion
+    return(replicate(31, patient_id)) # Replicate patient_id 31 times
+  } else { # Otherwise
+    return(replicate(last_fu_date - cart_date + 1, patient_id)) # Replicate patient_id according to number of days of follow-up, adding 1 to account for day +0
+  }
+}
+```
+
+We apply replicate_ids() to df_extract to create the data frame that contains replicated patient IDs (df_id). We also add a "time_post_inf" column with values corresponding to each instance of patient_id.
+
+```{r}
+df_id <- df_extract %>%
+  dplyr::rowwise() %>% # Group dataframe by rows
+  do(data.frame(patient_id = replicate_ids(.$patient_id, .$cart_date, .$last_fu_date))) %>% # Apply replicate_ids to each row
+  group_by(patient_id) %>% 
+  mutate(time_post_inf = row_number() - 1) %>% 
+  ungroup()
+
+paged_table(df_id)
+```
+
+Then, we use df_id to complete the missing time_post_inf values in df_early_icaht:
+
+```{r}
+df_early_icaht <- df_early_icaht %>%
+  group_by(patient_id) %>%
+  merge(., # Merge data frames by patient_ID and time_post_inf
+        df_id,
+        by = c("patient_id", "time_post_inf"), 
+        all.y = TRUE) %>% 
+  ungroup()
+```
+
+Lastly, we complete the cart_date, last follow-up date, and date columns and remove "last_fu_date" since it is no longer needed:
+
+```{r}
+df_early_icaht <- df_early_icaht %>%
+  group_by(patient_id) %>%
+  mutate(
+    cart_date = as.Date(ifelse( # Fill in date of CAR T-cell infusion
+      is.na(cart_date), max(cart_date, na.rm = TRUE), cart_date
+    )),
+    last_fu_date = as.Date(ifelse( # Fill in dates of ANC values
+      is.na(last_fu_date),
+      max(last_fu_date, na.rm = TRUE),
+      last_fu_date
+    )),
+    date = as.Date(cart_date + time_post_inf)
+  ) %>% 
+  ungroup() %>% 
+  select(-last_fu_date)
+
+paged_table(df_early_icaht)
+```
+
+#### Linear interpolation of missing ANC data
+Next, we can impute the missing ANC data using linear interpolation. To impute the missing values, we use the na.approx() function from the {zoo} package.
+
+We impute missing ANC values for up to 7 consecutive missing values (specified by the "maxgap" argument), thus accounting for once weekly blood draws in the outpatient setting. ANC values that are missing for >7 consecutive days remain missing.
+
+```{r}
+df_early_icaht <- df_early_icaht %>%
+  arrange(patient_id, time_post_inf) %>% # Arrange variables in ascending order
+  group_by(patient_id) %>% 
+  mutate(anc = na.approx(anc, maxgap = 7, rule = 2)) %>% # Apply linear interpolation
+  ungroup()
+```
+
+Then, we round ANC values to nearest integer divisible by 10 (to resemble real ANC values):
+
+```{r}
+df_early_icaht <- df_early_icaht %>% 
+  mutate(anc = round(anc/10) * 10)
+```
+
+In this final version of our data frame, each patient has dates corresponding to days 0 through 30 post-CAR T-cell infusion or day of last follow-up, whichever is earlier, and up to 5 consecutive missing ANC values have been imputed. 
+
+```{r}
+paged_table(df_early_icaht)
+```
+
+### Application of {heatwaveR} package to automate early ICAHT grading
+The [{heatwaveR} package](https://robwschlegel.github.io/heatwaveR/)  was originally created to identify marine heatwaves and coldspells.^1,2^ 
+
+#### Definition of the concept of “exceedances”
+The exceedance() function in {heatwaveR} allows us to easily identify instances ("exceedances") where ANC decreases below a set threshold (e.g., 500 or 100 cells/μL) and the duration of each exceedance, defined as the number of consecutive days during which the ANC is below the threshold. We also can set the minimum duration of exceedances, whether to join adjacent exceedances across a pre-specified interval number of days, and whether to linearly interpolate missing ANC values.
+
+For the early ICAHT threshold of ANC ≤ 500 cells/μL, we apply exceedance() using the threshold of 501. We set the minimum exceedance duration to 1 day. We will grade early ICAHT according to the longest consecutive duration of neutropenia (i.e., the longest exceedance). In case of stable neutrophil recovery between periods of neutropenia, we will select the longest neutropenic period. In case of non-stable neutrophil recovery between periods of neutropenia, we will join the adjacent time periods. We will define stable neutrophil recovery based on the Center for International Blood and Marrow Transplant Research (CIBMTR) criteria for neutrophil engraftment (ANC above 500 for ≥ 3 consecutive days).
+
+exceedance() creates a list containing 2 data frames for each patient:
+<br> (1) The "threshold" data frame contains the daily ANC values, threshold, and dates on which the ANC decreased below the threshold. Key columns include "threshCriterion", "durationCriterion", "exceedance", and "exceedance_no".  When the ANC value decreases below the threshold, "threshCriterion" is TRUE.  "durationCriterion" is TRUE if the number of consecutive times "threshCriterion” is TRUE is equal to or greater than "minDuration". "exceedance" is TRUE if “threshCriterion” is TRUE and “duration_criterion" is TRUE. Note that missing ANC values will not contribute to an exceedance.
+<br> (2) The "exceedance" data frame contains each occurrence of an exceedance (sequentially numbered by “exceedance_no") and the duration.
+
+As a representative example, we apply exceedance() to our dataset and look at the resulting data frames for patient #5. We create a function with exceedance() using plyr::dlply(), which iteratively applies exceedance() to each patient_ID and return results in a list. Per the CIBMTR criteria, we require adjacent exceedances to be joined if ANC does not recover above 500 for ≥3 consecutive days between exceedances; thus, we set joinAcrossGaps to TRUE and maxGap to 2.
+
+```{r}
+exceedances_below_501 <-
+  plyr::dlply(.data = df_early_icaht, .variables = "patient_id", .fun = function(data) {
+    heatwaveR::exceedance(
+      data,
+      x = date,
+      y = anc,
+      threshold = 501,
+      below = TRUE, # Whether to detect exceedances below the threshold,
+      minDuration = 1, # Minimum duration for acceptance of detected exceedances
+      joinAcrossGaps = TRUE, # Whether to join exceedances which occur before/after gap
+      maxGap = 2 # Maximum length of gap allowed for joining of exceedances
+    )
+  })
+
+example <- exceedances_below_501[[5]]
+```
+
+Here is the "threshold" data frame:
+
+```{r}
+paged_table(example$threshold)
+```
+
+And the "exceedance" data frame:
+
+```{r}
+paged_table(example$exceedance)
+```
+
+#### Calculation of exceedances
+Since we are only interested in the output of the "exceedance" data frame, we extract the "exceedance" data frame as follows. We can use the same function as before, with the following modifications: 1) the use of plyr::ddply(), which splits a data frame, applies a function, and returns results in a data frame; and 2) the addition of "$exceedance" to the end of the function).
+
+```{r}
+df_exceedances_below_501 <-
+  plyr::ddply(.data = df_early_icaht, .variables = "patient_id", .fun = function(data) {
+    heatwaveR::exceedance(
+      data,
+      x = date,
+      y = anc,
+      threshold = 501,
+      below = TRUE,
+      minDuration = 1,
+      joinAcrossGaps = TRUE,
+      maxGap = 2
+    )$exceedance
+  })
+```
+
+Next, we create a data frame containing the longest exceedances for each patient. If a patient never had ANC below 501, then duration is missing (NA) and we can replace it with 0. Remember, early ICAHT grades will ultimately be assigned based on the longest duration of these exceedances.
+
+```{r}
+df_anc_500 <- df_exceedances_below_501 %>%
+  select(patient_id, exceedance_no, duration) %>%
+  group_by(patient_id) %>%
+  dplyr::summarize(duration_below_501_max = max(duration)) %>% # Calculate maximum duration below threshold
+  mutate(duration_below_501_max = ifelse( # Replace NAs with 0 (never below threshold)
+    is.na(duration_below_501_max),
+    0,
+    duration_below_501_max
+  )) 
+
+kable(df_anc_500)
+```
+
+To reflect the early ICAHT threshold of ANC ≤ 100 cells/μL, we implement exceedance() as above, but now using a threshold value of 101:
+
+```{r}
+df_exceedances_below_101 <-
+  plyr::ddply(.data = df_early_icaht, .variables = "patient_id", function(data) {
+    heatwaveR::exceedance(
+      data,
+      x = date,
+      y = anc,
+      threshold = 101,
+      below = TRUE,
+      minDuration = 1,
+      joinAcrossGaps = TRUE,
+      maxGap = 2
+    )$exceedance
+  })
+
+df_anc_100 <- df_exceedances_below_101 %>%
+  select(patient_id, exceedance_no, duration) %>%
+  group_by(patient_id) %>%
+  dplyr::summarize(duration_below_101_max = max(duration)) %>%
+  mutate(duration_below_101_max = ifelse(
+    is.na(duration_below_101_max),
+    0,
+    duration_below_101_max
+  ))
+
+kable(df_anc_100)
+```
+
+We combine df_anc_500 and df_anc_100 so that for each patient, we obtain the longest exceedance during which ANC ≤ 500 cells/μL and ≤ 100 cells/μL.
+
+```{r}
+df_early_icaht_grades <- df_anc_500 %>% 
+  left_join(., df_anc_100, by = "patient_id")
+
+kable(df_early_icaht_grades)
+```
+
+### Assignment of early ICAHT grades
+
+We assign the early ICAHT grades according to the EHA/EBMT ICAHT criteria:^3^
+
+```{r}
+df_early_icaht_grades <- df_early_icaht_grades %>%
+  mutate(
+    early_icaht_grade = case_when(
+      duration_below_501_max == 0 &
+        duration_below_101_max == 0 ~ "Grade 0",
+      duration_below_501_max %in% 1:6 &
+        duration_below_101_max < 7 ~ "Grade 1",
+      duration_below_501_max %in% 7:13 &
+        duration_below_101_max < 7 ~ "Grade 2",
+      (duration_below_501_max %in% 14:30 &
+         duration_below_101_max < 7) |
+        (duration_below_501_max < 31 &
+           duration_below_101_max %in% 7:13) ~ "Grade 3",
+      (duration_below_501_max >= 31 &
+         duration_below_101_max < 14) |
+        duration_below_101_max >= 14 ~ "Grade 4"
+    )
+  )
+
+kable(df_early_icaht_grades)
+```
+
+### Additionally defining grade 4 early ICAHT
+
+One of the definitions for grade 4 early ICAHT is never recovering ANC > 500 cells/μL. There are other specific scenarios that we want to define as grade 4:
+<br> 1) A patient who has delayed ANC nadir ≤ 500 cells/μL after lymphodepletion and never experiences count recovery by day +30.
+<br> 2) A patient who dies early after CAR T-cell infusion without ever experiencing count recovery.
+
+Because the {heatwaveR} method assigns early ICAHT grades based on the longest period of neutropenia, it may "under-grade" these patients. For example, patient #8 never experienced count recovery before death/last follow-up on day +16, but was assigned an early ICAHT grade of 3.
+
+```{r}
+kable(df_early_icaht %>% filter(patient_id == 8))
+kable(df_early_icaht_grades %>% filter(patient_id == 8))
+```
+
+To account for such scenarios, we will assign patients who experience neutropenia starting between days 0-3 and through the last date of laboratory testing as having grade 4 early ICAHT. In other words, patients with exceedances below ANC ≤ 500 cells/μL that start between days 0-3 and do not end by the last date with an ANC value will be classified as grade 4 early ICAHT.
+
+We modify and join our exceedance data frame as follows, selecting the relevant variables: patient IDs, exceedance start dates, and exceedance end dates.
+
+```{r}
+df_exceedances_below_501 <- df_exceedances_below_501 %>%
+  filter(!is.na(exceedance_no)) %>%  # Filter out patients who never had neutropenia
+  select(patient_id, 
+         exceedance_below_501_no = exceedance_no, 
+         exceedance_below_501_date_start = date_start,
+         exceedance_below_501_date_end = date_end) %>% 
+  mutate(exceedance_below_501_date_start = as.Date(exceedance_below_501_date_start), # Convert dates to class "Date"
+         exceedance_below_501_date_end = as.Date(exceedance_below_501_date_end))
+
+kable(df_exceedances_below_501)
+```
+
+We add the corresponding dates ("last_lab_date") of the last available ANC value:
+
+```{r}
+df_last_time_post_inf <- df_early_icaht %>%
+  arrange(patient_id, time_post_inf) %>%
+  group_by(patient_id) %>% 
+  slice_tail(n = 1) %>% # # Select last row (latest time_post_inf)
+  ungroup() %>% 
+  select(patient_id, 
+         cart_date,
+         last_lab_date = date)
+
+df_exceedances_below_501 <- df_exceedances_below_501 %>% 
+  left_join(., df_last_time_post_inf, by = "patient_id")
+
+paged_table(df_exceedances_below_501)
+```
+
+Now, we classify patients who had exceedances below ANC ≤ 500 cells/μL starting between days 0-3 and ending on "last_lab_date" as grade 4 early ICAHT: 
+
+```{r}
+df_exceedances_below_501 <- df_exceedances_below_501 %>%
+  mutate(
+    early_icaht_grade_4 = ifelse(
+      exceedance_below_501_date_start - cart_date <= 3 &
+        exceedance_below_501_date_end == last_lab_date,
+      "Yes",
+      "No"
+    )
+  )
+
+paged_table(df_exceedances_below_501)
+```
+
+Finally, we incorporate these grade 4 cases into df_early_icaht:
+
+```{r}
+df_early_icaht_grades <- df_early_icaht_grades %>%
+  left_join(.,
+            df_exceedances_below_501 %>% select(patient_id, early_icaht_grade_4),
+            by = "patient_id")
+
+df_early_icaht_grades <- df_early_icaht_grades %>%
+  mutate(
+    early_icaht_grade = dplyr::if_else( # Assign grade 4 to the above unique cases; otherwise, keep original ICAHT grade
+      early_icaht_grade_4 == "Yes",
+      "Grade 4",
+      early_icaht_grade,
+      missing = early_icaht_grade
+    )
+  ) %>%
+  distinct(patient_id,
+           duration_below_501_max,
+           duration_below_101_max,
+           early_icaht_grade,
+           early_icaht_grade_4)
+
+kable(df_early_icaht_grades)
+```
+
+## Automated grading of late ICAHT
+
+We will grade late ICAHT based on ANC values from day +31 to the earliest of day +100, date of subsequent therapy, date of relapse/progression, or date of last follow-up. Using our original data frame, we restrict the dates of laboratory testing to these periods:
+
+```{r}
+df_late_icaht <- df %>%
+  mutate(
+    date_earliest = pmin( # Find earliest date from the following:
+      cart_date + 100, # Day +100 after CAR T-cell infusion
+      subsequent_therapy_date, # Date of subsequent therapy
+      progression_date, # Date of relapse/progression
+      last_fu_date, # Date of last follow-up
+      na.rm = TRUE
+    ),
+    time_post_inf = as.numeric(date - cart_date)
+  ) %>%
+  filter(time_post_inf >= 31, # Filter to period between day +31 and date_earliest
+         date <= date_earliest)
+
+df_late_icaht <- df_late_icaht %>%
+  distinct(patient_id,
+           time_post_inf,
+           anc,
+           .keep_all = TRUE) %>%
+  group_by(patient_id, time_post_inf) %>%
+  slice_min(anc) %>%
+  ungroup()
+
+paged_table(df_late_icaht)
+```
+
+Next, for each patient we obtain the 2 lowest ANC values during these periods. 
+
+```{r}
+df_late_icaht <- df_late_icaht %>%
+  select(patient_id, cart_date, anc, date, time_post_inf) %>% 
+  group_by(patient_id) %>%
+  arrange(anc) %>% # Arrange ANC values in ascending order
+  slice_head(n = 2) %>% # Select 2 lowest ANC values
+  mutate(anc_1 = anc[1],
+         anc_2 = anc[2]) %>% 
+  slice_head(n = 1) %>% # Select first row for each patient
+  ungroup()
+
+paged_table(df_late_icaht)
+```
+
+Then, we assign late ICAHT grades according to EHA/EBMT criteria:
+<br> 1) The late ICAHT grade will be assigned based on the nadir ANC value. While this may "overgrade" patients, it is important to identify the highest severity of neutropenia.
+<br> 2) Patients who only have 1 available ANC value after day +30 will be assigned a late ICAHT grade based on that value.
+
+Depending on the clinical question and quality of follow-up, extending the follow-up for late ICAHT to day +180 or +365 could be reasonable. However, if the follow-up is extended, one should consider defining an interval between which the 2 ANC values are considered “non-transient” (for example, specifying that the 2 values must occur within a certain number of days).
+
+```{r}
+df_late_icaht_grades <- df_late_icaht %>%
+  select(patient_id, anc_1, anc_2) %>% 
+  mutate(
+    late_icaht_grade = case_when(
+      (anc_1 %in% 1001:1500 & anc_2 <= 1500) | (anc_1 %in% 1001:1500 & is.na(anc_2)) ~ "Grade 1",
+      (anc_1 %in% 501:1000 & anc_2 <= 1500) | (anc_1 %in% 501:1000 & is.na(anc_2)) ~ "Grade 2",
+      (anc_1 %in% 101:500 & anc_2 <= 1500) | (anc_1 %in% 101:500 & is.na(anc_2)) ~ "Grade 3",
+      (anc_1 <= 100 & anc_2 <= 1500) | (anc_1 <= 100 & is.na(anc_2)) ~ "Grade 4",
+      .default = "Grade 0"
+    )
+  ) %>% 
+  left_join(df %>% distinct(patient_id), ., by = "patient_id") # Join late ICAHT grades to patient IDs (including those without ANC values after day +30)
+
+kable(df_late_icaht_grades)
+```
+
+Voilà! We have automated both early and late ICAHT grading!
+
+## Export early and late ICAHT grades
+
+We can combine the early and late ICAHT grades into one data frame as follows:
+
+```{r}
+df_icaht_grades <- df_early_icaht_grades %>%
+  select(patient_id, early_icaht_grade) %>%
+  left_join(.,
+            df_late_icaht_grades %>% select(patient_id, late_icaht_grade),
+            by = "patient_id")
+
+kable(df_icaht_grades)
+```
+
+To export the automated ICAHT grades to an Excel file, use the following command:
+
+```{r, eval = FALSE, include = TRUE}
+write.xlsx(df_icaht_grades, "Automated ICAHT Grades.xlsx")
+```
+
+## References
+<br> 1. Schlegel RW, Smit AJ. heatwaveR: A central algorithm for the detection of heatwaves and cold-spells. *Journal of Open Source Software*. 2018;3(27):821.
+<br> 2. Smit A. Detect event streaks based on specified thresholds. The Tangled Bank. https://tangledbank.netlify.app/blog/2023-11-22-run-lengths.
+<br> 3. Rejeski K, Subklewe M, Aljurf M, et al. Immune Effector Cell-Associated Hematotoxicity (ICAHT): EHA/EBMT Consensus Grading and Best Practice Recommendations. *Blood*. 2023;142(10):865–877.
